@@ -68,19 +68,23 @@ const (
 )
 
 type StressConfig struct {
-	Target     *url.URL
-	Threads    int
-	Duration   time.Duration
-	CustomHost string
-	Port       int
-	Path       string
-	ProxyType  string
-	Proxies    []string
-	JitterMs   int  // max per-request jitter in milliseconds (0 = disabled)
-	SendOnly   bool // do not wait for/parse responses
-	CacheBust  bool // append a random cache-busting query parameter
-	XFF        bool // add synthetic X-Forwarded-For headers
-	session    *browserSession
+	Target        *url.URL
+	Threads       int
+	Duration      time.Duration
+	CustomHost    string
+	Port          int
+	Path          string
+	ProxyType     string
+	Proxies       []string
+	JitterMs      int    // max per-request jitter in milliseconds (0 = disabled)
+	SendOnly      bool   // do not wait for/parse responses
+	CacheBust     bool   // append a random cache-busting query parameter
+	XFF           bool   // add synthetic X-Forwarded-For headers
+	Fingerprint   string // rotate, chrome, firefox, safari, ios, none
+	HTTP2         bool   // negotiate HTTP/2 when the server supports it
+	ProxyRotation string // round-robin, random, sticky
+	RotateEvery   int    // reconnect after N requests (0 = disabled)
+	session       *browserSession
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -123,8 +127,9 @@ var (
 
 	cacheBusterKeys = []string{"_", "v", "cb", "t", "r", "nocache", "ts", "rnd"}
 
-	// chromeCipherSuites are the TLS 1.2 cipher suites offered by Chrome-like
-	// profiles. A fixed order is used so each session looks consistent.
+	// chromeCipherSuites are used by the non-mimicking crypto/tls fallback
+	// (--fingerprint=none and tests). Browser mimicry uses uTLS ClientHello
+	// profiles instead of this fixed list.
 	chromeCipherSuites = []uint16{
 		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -166,41 +171,50 @@ func init() {
 	// 500 profiles with diverse browser/OS/mobile combinations.
 	uaProfiles = make([]uaProfile, 500)
 	for i := range uaProfiles {
-		ua := generateUserAgent()
-		p := uaProfile{
-			ua:      ua,
-			mobile:  strings.Contains(ua, "Mobile"),
-			chrome:  strings.Contains(ua, "Chrome/"),
-			firefox: strings.Contains(ua, "Firefox/"),
-		}
-		switch {
-		case p.firefox:
-			p.accept = acceptFirefox
-			p.encoding = "gzip, deflate, br, zstd"
-		case p.chrome:
-			p.accept = acceptChrome
-			p.encoding = "gzip, deflate, br, zstd"
-		default:
-			p.accept = acceptSafari
-			p.encoding = "gzip, deflate, br"
-		}
-		if p.chrome {
-			p.chromeMajor = chromeMajorFromUA(ua)
-			p.platform = platformFromUA(ua)
-			p.secChUa = fmt.Sprintf("sec-ch-ua: \"Google Chrome\";v=\"%s\", \"Chromium\";v=\"%s\", \"Not_A Brand\";v=\"99\"\r\n",
-				p.chromeMajor, p.chromeMajor)
-			if major, err := strconv.Atoi(p.chromeMajor); err == nil && major >= 115 {
-				p.hasPriority = true
-			}
-		}
-		uaProfiles[i] = p
+		uaProfiles[i] = makeUAProfile(generateUserAgent())
 	}
 	defaultSession = newBrowserSession()
 }
 
+func makeUAProfile(ua string) uaProfile {
+	p := uaProfile{
+		ua:      ua,
+		mobile:  strings.Contains(ua, "Mobile"),
+		chrome:  strings.Contains(ua, "Chrome/"),
+		firefox: strings.Contains(ua, "Firefox/"),
+	}
+	switch {
+	case p.firefox:
+		p.accept = acceptFirefox
+		p.encoding = "gzip, deflate, br, zstd"
+	case p.chrome:
+		p.accept = acceptChrome
+		p.encoding = "gzip, deflate, br, zstd"
+	default:
+		p.accept = acceptSafari
+		p.encoding = "gzip, deflate, br"
+	}
+	if p.chrome {
+		p.chromeMajor = chromeMajorFromUA(ua)
+		p.platform = platformFromUA(ua)
+		p.secChUa = fmt.Sprintf("sec-ch-ua: \"Google Chrome\";v=\"%s\", \"Chromium\";v=\"%s\", \"Not_A Brand\";v=\"99\"\r\n",
+			p.chromeMajor, p.chromeMajor)
+		if major, err := strconv.Atoi(p.chromeMajor); err == nil && major >= 115 {
+			p.hasPriority = true
+		}
+	}
+	return p
+}
+
 func newBrowserSession() *browserSession {
+	return newBrowserSessionFor("rotate")
+}
+
+// newBrowserSessionFor creates one coherent browser identity. The mode selects
+// the browser family and therefore the matching TLS/HTTP2 fingerprint.
+func newBrowserSessionFor(mode string) *browserSession {
 	s := &browserSession{
-		profile:  uaProfiles[rand.IntN(len(uaProfiles))],
+		profile:  newProfileForMode(mode),
 		language: languages[rand.IntN(len(languages))],
 	}
 	// Roughly half of sessions represent a returning visitor with stable
@@ -213,6 +227,14 @@ func newBrowserSession() *browserSession {
 			gaBase, now-rand.Int64N(90*24*3600), gidBase, now)
 	}
 	return s
+}
+
+// cookieValue returns the Cookie header value without the header name or CRLF.
+func (s *browserSession) cookieValue() string {
+	if s == nil || s.cookieHeader == "" {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(s.cookieHeader, "Cookie: "), "\r\n")
 }
 
 // ─── Manager ──────────────────────────────────────────────────────────────────
@@ -272,16 +294,20 @@ func runDirect(rawURL string, threads int, duration time.Duration, customHost st
 	}
 
 	cfg := StressConfig{
-		Target:     parsedURL,
-		Threads:    threads,
-		Duration:   duration,
-		CustomHost: customHost,
-		Port:       determinePort(parsedURL),
-		Path:       path,
-		JitterMs:   opts.JitterMs,
-		SendOnly:   opts.SendOnly,
-		CacheBust:  opts.CacheBust,
-		XFF:        opts.XFF,
+		Target:        parsedURL,
+		Threads:       threads,
+		Duration:      duration,
+		CustomHost:    customHost,
+		Port:          determinePort(parsedURL),
+		Path:          path,
+		JitterMs:      opts.JitterMs,
+		SendOnly:      opts.SendOnly,
+		CacheBust:     opts.CacheBust,
+		XFF:           opts.XFF,
+		Fingerprint:   opts.Fingerprint,
+		HTTP2:         opts.HTTP2,
+		ProxyRotation: opts.ProxyRotation,
+		RotateEvery:   opts.RotateEvery,
 	}
 
 	// Initial DNS lookup.
@@ -329,6 +355,9 @@ func runDirect(rawURL string, threads int, duration time.Duration, customHost st
 		"send_only", cfg.SendOnly,
 		"cache_bust", cfg.CacheBust,
 		"xff", cfg.XFF,
+		"fingerprint", cfg.Fingerprint,
+		"http2", cfg.HTTP2 && !strings.EqualFold(cfg.Fingerprint, "none"),
+		"rotate_every", cfg.RotateEvery,
 	)
 	mgr.runManager(rootCtx)
 	<-statsDone
@@ -431,7 +460,6 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 	defer m.wg.Done()
 
 	cfg := m.cfg
-	cfg.session = newBrowserSession() // one browser identity per worker/connection
 	hostHdr := requestHost(cfg)
 	serverName := requestServerName(cfg)
 	addr := net.JoinHostPort(ip, strconv.Itoa(cfg.Port))
@@ -439,14 +467,12 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 	backoff := initialBackoff
 
 	for ctx.Err() == nil {
+		// Rotate the browser identity (UA, client hints, cookies, TLS ClientHello
+		// and HTTP/2 profile) for every new connection.
+		cfg.session = newBrowserSessionFor(cfg.Fingerprint)
+
 		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-		var conn net.Conn
-		var err error
-		if useTLS {
-			conn, err = dialConn(dialCtx, addr, true, newTLSConfig(serverName))
-		} else {
-			conn, err = dialConn(dialCtx, addr, false, nil)
-		}
+		conn, err := dialConnSession(dialCtx, addr, useTLS, cfg, serverName)
 		cancel()
 
 		if err != nil {
@@ -481,13 +507,17 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 			continue
 		}
 
-		// The server closed a keep-alive connection cleanly; re-dial at once.
+		// The server closed a keep-alive connection cleanly or the connection
+		// reached --rotate-every; re-dial at once.
 		backoff = initialBackoff
 	}
 }
 
 // exchange runs one connection in either response-aware or send-only mode.
 func (m *Manager) exchange(ctx context.Context, cfg StressConfig, conn net.Conn, hostHdr string) (int, error) {
+	if isHTTP2Conn(conn) {
+		return h2Exchange(ctx, cfg, conn, hostHdr, &m.metrics)
+	}
 	if cfg.SendOnly {
 		return sendOnlyConnection(ctx, cfg, conn, hostHdr, &m.metrics)
 	}
@@ -539,6 +569,9 @@ func serveConnection(ctx context.Context, cfg StressConfig, conn net.Conn, hostH
 		_ = conn.SetDeadline(time.Time{})
 
 		if resp.Close {
+			return completed, nil
+		}
+		if cfg.RotateEvery > 0 && completed >= cfg.RotateEvery {
 			return completed, nil
 		}
 
@@ -612,8 +645,19 @@ func sendOnlyConnection(ctx context.Context, cfg StressConfig, conn net.Conn, ho
 			return sent, ctx.Err()
 		}
 
+		requestBudget := batchRequests
+		if cfg.RotateEvery > 0 {
+			remaining := cfg.RotateEvery - sent
+			if remaining <= 0 {
+				return sent, nil
+			}
+			if remaining < requestBudget {
+				requestBudget = remaining
+			}
+		}
+
 		batch.Reset()
-		n := buildSendBatch(batch, body, cfg, hostHdr, batchRequests, sendBatchBytes)
+		n := buildSendBatch(batch, body, cfg, hostHdr, requestBudget, sendBatchBytes)
 		if n == 0 {
 			continue
 		}
@@ -634,6 +678,10 @@ func sendOnlyConnection(ctx context.Context, cfg StressConfig, conn net.Conn, ho
 
 		metrics.recordSentN(n)
 		sent += n
+
+		if cfg.RotateEvery > 0 && sent >= cfg.RotateEvery {
+			return sent, nil
+		}
 
 		// Jitter: small random sleep between requests.
 		if cfg.JitterMs > 0 {
@@ -750,20 +798,7 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, method, hostHdr string, b
 
 	// Coherent navigation source: direct (no Referer), external (cross-site),
 	// or same-origin. POST is a form submission; HEAD is a same-origin fetch.
-	site := "same-origin"
-	refererMode := 1 // 0 none, 1 same-origin, 2 external
-	if method == "GET" {
-		switch r := rand.IntN(10); {
-		case r < 5:
-			site, refererMode = "none", 0
-		case r < 8:
-			site, refererMode = "cross-site", 2
-		}
-	}
-	var externalReferer string
-	if refererMode == 2 {
-		externalReferer = referers[rand.IntN(len(referers))]
-	}
+	site, refererMode, externalReferer := requestFetchContext(method)
 
 	buf.WriteString(method)
 	buf.WriteByte(' ')
@@ -886,6 +921,20 @@ func writePageURL(buf *bytes.Buffer, cfg StressConfig, hostHdr string) {
 	}
 }
 
+// pageURLString returns the target page URL used by HTTP/2 Referer headers.
+func pageURLString(cfg StressConfig, hostHdr string) string {
+	var b strings.Builder
+	b.WriteString(cfg.Target.Scheme)
+	b.WriteString("://")
+	b.WriteString(hostHdr)
+	if cfg.Path == "" {
+		b.WriteByte('/')
+	} else {
+		b.WriteString(cfg.Path)
+	}
+	return b.String()
+}
+
 // writeRequestTarget writes origin-form for direct/SOCKS/CONNECT requests and
 // absolute-form for plain HTTP requests sent through an HTTP(S) proxy.
 func writeRequestTarget(buf *bytes.Buffer, cfg StressConfig, method string) {
@@ -894,7 +943,11 @@ func writeRequestTarget(buf *bytes.Buffer, cfg StressConfig, method string) {
 		buf.WriteString("://")
 		buf.WriteString(cfg.Target.Host)
 	}
+	writePath(buf, cfg, method)
+}
 
+// writePath writes the origin-form request path with optional cache busting.
+func writePath(buf *bytes.Buffer, cfg StressConfig, method string) {
 	if cfg.Path == "" {
 		buf.WriteByte('/')
 	} else {
@@ -913,6 +966,31 @@ func writeRequestTarget(buf *bytes.Buffer, cfg StressConfig, method string) {
 		buf.WriteByte('=')
 		writeInt(buf, rand.Int64N(1_000_000_000))
 	}
+}
+
+// requestPath returns the origin-form request target used by HTTP/2.
+func requestPath(cfg StressConfig, method string) string {
+	var b bytes.Buffer
+	writePath(&b, cfg, method)
+	return b.String()
+}
+
+// requestFetchContext picks a coherent navigation source for a request.
+func requestFetchContext(method string) (site string, refererMode int, externalReferer string) {
+	site = "same-origin"
+	refererMode = 1 // 0 none, 1 same-origin, 2 external
+	if method == "GET" {
+		switch r := rand.IntN(10); {
+		case r < 5:
+			site, refererMode = "none", 0
+		case r < 8:
+			site, refererMode = "cross-site", 2
+		}
+	}
+	if refererMode == 2 {
+		externalReferer = referers[rand.IntN(len(referers))]
+	}
+	return site, refererMode, externalReferer
 }
 
 func writeInt(buf *bytes.Buffer, n int64) {
@@ -1087,22 +1165,48 @@ func lookupIPv4(ctx context.Context, host string) ([]string, error) {
 // ─── Dialling ─────────────────────────────────────────────────────────────────
 
 // dialConn dials addr using a context-aware dialer. TLS is selected from the
-// target URL scheme, not from the port number.
+// target URL scheme, not from the port number. It keeps the original
+// *tls.Config signature for tests and callers that do not have a StressConfig;
+// production workers use dialConnSession so the session fingerprint applies.
 func dialConn(ctx context.Context, addr string, useTLS bool, tlsCfg *tls.Config) (net.Conn, error) {
-	netDialer := &net.Dialer{
+	raw, err := newNetDialer().DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if !useTLS {
+		return raw, nil
+	}
+	serverName := ""
+	if tlsCfg != nil {
+		serverName = tlsCfg.ServerName
+	}
+	return tlsHandshake(ctx, raw, serverName, defaultChromeFingerprint(), false)
+}
+
+// dialConnSession dials and performs a fingerprint-matched TLS handshake using
+// the session selected for this connection.
+func dialConnSession(ctx context.Context, addr string, useTLS bool, cfg StressConfig, serverName string) (net.Conn, error) {
+	raw, err := newNetDialer().DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if !useTLS {
+		return raw, nil
+	}
+	return tlsHandshake(ctx, raw, serverName, fingerprintForConfig(cfg), cfg.HTTP2)
+}
+
+func newNetDialer() *net.Dialer {
+	return &net.Dialer{
 		Timeout:   dialTimeout,
 		KeepAlive: 30 * time.Second,
 	}
-	if !useTLS {
-		return netDialer.DialContext(ctx, "tcp", addr)
-	}
-	// tls.Dialer.DialContext honours ctx cancellation for both dial and handshake.
-	return (&tls.Dialer{NetDialer: netDialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 }
 
 // newTLSConfig builds a TLS config with a fixed Chrome-like cipher order.
 // InsecureSkipVerify is intentional: the tool must be able to test home-lab
-// servers with self-signed certificates.
+// servers with self-signed certificates. It is the non-mimicking fallback used
+// by tests and --fingerprint=none.
 func newTLSConfig(serverName string) *tls.Config {
 	return &tls.Config{
 		ServerName:         serverName,
@@ -1280,7 +1384,9 @@ func generateChromeDesktopUA() string {
 		"X11; Linux x86_64",
 	}
 	os := osList[rand.IntN(len(osList))]
-	major := rand.IntN(14) + 140 // v140–v153
+	// Versions match the uTLS ClientHello profiles that are available.
+	versions := []int{120, 131, 133}
+	major := versions[rand.IntN(len(versions))]
 	return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36",
 		os, major)
 }
@@ -1293,39 +1399,40 @@ func generateFirefoxDesktopUA() string {
 		"X11; Ubuntu; Linux x86_64",
 	}
 	os := osList[rand.IntN(len(osList))]
-	major := rand.IntN(13) + 140 // v140–v152
+	versions := []int{102, 105, 120}
+	major := versions[rand.IntN(len(versions))]
 	return fmt.Sprintf("Mozilla/5.0 (%s; rv:%d.0) Gecko/20100101 Firefox/%d.0", os, major, major)
 }
 
 func generateSafariDesktopUA() string {
-	macVersions := []string{"10_15_7", "13_6_1", "14_6_1", "15_3_1"}
-	mac := macVersions[rand.IntN(len(macVersions))]
-	major := 18 + rand.IntN(2) // v18–v19
-	return fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X %s) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%d.%d Safari/605.1.15",
-		mac, major, rand.IntN(7))
+	// uTLS ships a Safari 16 ClientHello profile.
+	return "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
 }
 
 func generateChromeAndroidUA() string {
 	// Chrome's reduced Android UA reports Android 10 and the device model as K.
-	major := rand.IntN(14) + 140 // v140–v153
+	versions := []int{120, 131, 133}
+	major := versions[rand.IntN(len(versions))]
 	return fmt.Sprintf("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Mobile Safari/537.36",
 		major)
 }
 
 func generateSafariIOSUA() string {
-	versions := []string{
-		"iPhone; CPU iPhone OS 18_6 like Mac OS X",
-		"iPhone; CPU iPhone OS 19_0 like Mac OS X",
-		"iPhone; CPU iPhone OS 19_2 like Mac OS X",
-		"iPad; CPU OS 18_6 like Mac OS X",
-		"iPad; CPU OS 19_0 like Mac OS X",
+	// uTLS ships iOS 12.1, 13 and 14 ClientHello profiles.
+	type iosVersion struct {
+		os     string
+		safari string
 	}
-	builds := []string{"604.1", "605.1.15"}
+	versions := []iosVersion{
+		{"iPhone; CPU iPhone OS 13_6 like Mac OS X", "13.0"},
+		{"iPhone; CPU iPhone OS 14_8 like Mac OS X", "14.0"},
+		{"iPad; CPU OS 13_6 like Mac OS X", "13.0"},
+		{"iPad; CPU OS 14_8 like Mac OS X", "14.0"},
+	}
 	v := versions[rand.IntN(len(versions))]
-	sb := builds[rand.IntN(len(builds))]
-	major := 18 + rand.IntN(2) // v18–v19
-	return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%d.%d Mobile/15E148 Safari/%s",
-		v, major, rand.IntN(7), sb)
+	sb := "605.1.15"
+	return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%s Mobile/15E148 Safari/%s",
+		v.os, v.safari, sb)
 }
 
 // chromeMajorFromUA extracts the major version from a Chrome/xxx.y.z UA.

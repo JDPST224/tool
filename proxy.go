@@ -32,6 +32,7 @@ import (
 type ProxyManager struct {
 	cfg     StressConfig
 	metrics Metrics
+	rotator *proxyRotator
 	wg      sync.WaitGroup
 }
 
@@ -39,6 +40,7 @@ func NewProxyManager(cfg StressConfig) *ProxyManager {
 	return &ProxyManager{
 		cfg:     cfg,
 		metrics: Metrics{sendOnly: cfg.SendOnly},
+		rotator: newProxyRotator(cfg.Proxies, cfg.ProxyRotation),
 	}
 }
 
@@ -72,18 +74,22 @@ func runProxy(rawURL string, threads int, duration time.Duration, proxyType stri
 	slog.Info("loaded proxies", "count", len(proxies))
 
 	cfg := StressConfig{
-		Target:     parsedURL,
-		Threads:    threads,
-		Duration:   duration,
-		CustomHost: customHost,
-		Port:       determinePort(parsedURL),
-		Path:       path,
-		ProxyType:  proxyType,
-		Proxies:    proxies,
-		JitterMs:   opts.JitterMs,
-		SendOnly:   opts.SendOnly,
-		CacheBust:  opts.CacheBust,
-		XFF:        opts.XFF,
+		Target:        parsedURL,
+		Threads:       threads,
+		Duration:      duration,
+		CustomHost:    customHost,
+		Port:          determinePort(parsedURL),
+		Path:          path,
+		ProxyType:     proxyType,
+		Proxies:       proxies,
+		JitterMs:      opts.JitterMs,
+		SendOnly:      opts.SendOnly,
+		CacheBust:     opts.CacheBust,
+		XFF:           opts.XFF,
+		Fingerprint:   opts.Fingerprint,
+		HTTP2:         opts.HTTP2,
+		ProxyRotation: opts.ProxyRotation,
+		RotateEvery:   opts.RotateEvery,
 	}
 
 	mgr := NewProxyManager(cfg)
@@ -116,10 +122,15 @@ func runProxy(rawURL string, threads int, duration time.Duration, proxyType stri
 		"threads", threads,
 		"duration", cfg.Duration,
 		"proxy_type", proxyType,
+		"proxy_count", len(proxies),
+		"proxy_rotation", cfg.ProxyRotation,
 		"custom_host", cfg.CustomHost,
 		"send_only", cfg.SendOnly,
 		"cache_bust", cfg.CacheBust,
 		"xff", cfg.XFF,
+		"fingerprint", cfg.Fingerprint,
+		"http2", cfg.HTTP2 && !strings.EqualFold(cfg.Fingerprint, "none"),
+		"rotate_every", cfg.RotateEvery,
 	)
 	mgr.runProxyManager(rootCtx)
 	<-statsDone
@@ -220,9 +231,9 @@ func (m *ProxyManager) runProxyManager(ctx context.Context) {
 		go m.proxyWorkerLoop(wctx, idx)
 	}
 
-	// Spawn workers evenly distributed across proxies.
+	// Spawn workers; each new connection picks a proxy from the rotator.
 	for i := 0; i < m.cfg.Threads; i++ {
-		spawn(i % len(m.cfg.Proxies))
+		spawn(i)
 	}
 
 	<-ctx.Done()
@@ -236,18 +247,20 @@ func (m *ProxyManager) runProxyManager(ctx context.Context) {
 
 // ─── Proxy Worker ─────────────────────────────────────────────────────────────
 
-func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
+func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, workerID int) {
 	defer m.wg.Done()
 
 	cfg := m.cfg
-	cfg.session = newBrowserSession() // one browser identity per worker/connection
 	hostHdr := requestHost(cfg)
 	serverName := requestServerName(cfg)
-	proxies := cfg.Proxies
 	backoff := initialBackoff
 
 	for ctx.Err() == nil {
-		proxyAddr := proxies[proxyIdx%len(proxies)]
+		proxyAddr := m.rotator.pick(workerID)
+
+		// Rotate the browser identity (UA, client hints, cookies, TLS
+		// ClientHello and HTTP/2 profile) for every new connection.
+		cfg.session = newBrowserSessionFor(cfg.Fingerprint)
 
 		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 		conn, err := dialViaProxy(dialCtx, proxyAddr, cfg, newTLSConfig(serverName))
@@ -257,9 +270,9 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 			if ctx.Err() != nil {
 				return
 			}
+			m.rotator.markFailure(proxyAddr)
 			m.metrics.recordError(err)
 			slog.Debug("proxy dial failed", "proxy", proxyAddr, "err", err, "backoff", backoff)
-			proxyIdx++
 			if !sleepCtx(ctx, backoff) {
 				return
 			}
@@ -276,11 +289,13 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 		if serveErr != nil {
 			m.metrics.recordError(serveErr)
 			if completed > 0 {
+				// The proxy carried traffic; the target or connection ended.
+				m.rotator.markSuccess(proxyAddr)
 				backoff = initialBackoff
+			} else {
+				m.rotator.markFailure(proxyAddr)
 			}
 			slog.Debug("proxy connection error", "proxy", proxyAddr, "err", serveErr, "backoff", backoff)
-			// Rotate to the next proxy after a failed connection.
-			proxyIdx++
 			if !sleepCtx(ctx, backoff) {
 				return
 			}
@@ -288,14 +303,18 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 			continue
 		}
 
-		// The target closed a keep-alive connection cleanly; re-dial the same
-		// proxy immediately.
+		// The target closed a keep-alive connection cleanly or the connection
+		// reached --rotate-every; re-dial through the next proxy immediately.
+		m.rotator.markSuccess(proxyAddr)
 		backoff = initialBackoff
 	}
 }
 
 // exchange runs one connection in either response-aware or send-only mode.
 func (m *ProxyManager) exchange(ctx context.Context, cfg StressConfig, conn net.Conn, hostHdr string) (int, error) {
+	if isHTTP2Conn(conn) {
+		return h2Exchange(ctx, cfg, conn, hostHdr, &m.metrics)
+	}
 	if cfg.SendOnly {
 		return sendOnlyConnection(ctx, cfg, conn, hostHdr, &m.metrics)
 	}
@@ -321,10 +340,14 @@ func dialViaProxy(ctx context.Context, proxyAddr string, cfg StressConfig, targe
 }
 
 func newProxyNetDialer() *net.Dialer {
-	return &net.Dialer{
-		Timeout:   dialTimeout,
-		KeepAlive: 30 * time.Second,
+	return newNetDialer()
+}
+
+func targetServerName(cfg StressConfig, targetTLS *tls.Config) string {
+	if targetTLS != nil && targetTLS.ServerName != "" {
+		return targetTLS.ServerName
 	}
+	return requestServerName(cfg)
 }
 
 // dialHTTPProxy connects through an HTTP proxy.
@@ -348,44 +371,37 @@ func dialHTTPProxy(ctx context.Context, proxyAddr string, cfg StressConfig, targ
 		return nil, err
 	}
 
-	tlsConn := tls.Client(tunneled, targetTLS)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = tlsConn.Close()
-		return nil, fmt.Errorf("TLS handshake: %w", err)
-	}
-	return tlsConn, nil
+	return tlsHandshake(ctx, tunneled, targetServerName(cfg, targetTLS), fingerprintForConfig(cfg), cfg.HTTP2)
 }
 
 // dialHTTPSProxy connects through an HTTPS proxy (proxy over TLS).
 // Same as HTTP proxy but the connection to the proxy itself is TLS-encrypted.
 func dialHTTPSProxy(ctx context.Context, proxyAddr string, cfg StressConfig, targetTLS *tls.Config) (net.Conn, error) {
-	proxyTLS := &tls.Config{
-		InsecureSkipVerify: true, //nolint:gosec // proxies are usually self-signed in test setups
-		MinVersion:         tls.VersionTLS12,
-		CipherSuites:       chromeCipherSuites,
-		NextProtos:         []string{"http/1.1"},
+	raw, err := newProxyNetDialer().DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("connect to HTTPS proxy: %w", err)
 	}
-	tlsConn, err := (&tls.Dialer{NetDialer: newProxyNetDialer(), Config: proxyTLS}).DialContext(ctx, "tcp", proxyAddr)
+
+	proxyHost, _, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		proxyHost = proxyAddr
+	}
+	proxyConn, err := tlsHandshake(ctx, raw, proxyHost, fingerprintForConfig(cfg), false)
 	if err != nil {
 		return nil, fmt.Errorf("connect to HTTPS proxy: %w", err)
 	}
 
 	if cfg.Target.Scheme != "https" {
-		return tlsConn, nil
+		return proxyConn, nil
 	}
 
-	tunneled, err := establishTunnel(ctx, tlsConn, cfg)
+	tunneled, err := establishTunnel(ctx, proxyConn, cfg)
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = proxyConn.Close()
 		return nil, err
 	}
 
-	targetConn := tls.Client(tunneled, targetTLS)
-	if err := targetConn.HandshakeContext(ctx); err != nil {
-		_ = targetConn.Close()
-		return nil, fmt.Errorf("TLS handshake: %w", err)
-	}
-	return targetConn, nil
+	return tlsHandshake(ctx, tunneled, targetServerName(cfg, targetTLS), fingerprintForConfig(cfg), cfg.HTTP2)
 }
 
 // establishTunnel performs an HTTP CONNECT handshake and returns a connection
@@ -540,12 +556,7 @@ func dialSOCKS4(ctx context.Context, proxyAddr string, cfg StressConfig, targetT
 
 	// If target is HTTPS, upgrade to TLS.
 	if cfg.Target.Scheme == "https" {
-		tlsConn := tls.Client(conn, targetTLS)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = tlsConn.Close()
-			return nil, fmt.Errorf("TLS handshake: %w", err)
-		}
-		return tlsConn, nil
+		return tlsHandshake(ctx, conn, targetServerName(cfg, targetTLS), fingerprintForConfig(cfg), cfg.HTTP2)
 	}
 
 	return conn, nil
@@ -598,12 +609,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr string, cfg StressConfig, targetT
 
 	// If target is HTTPS, upgrade to TLS.
 	if cfg.Target.Scheme == "https" {
-		tlsConn := tls.Client(conn, targetTLS)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = tlsConn.Close()
-			return nil, fmt.Errorf("TLS handshake: %w", err)
-		}
-		return tlsConn, nil
+		return tlsHandshake(ctx, conn, targetServerName(cfg, targetTLS), fingerprintForConfig(cfg), cfg.HTTP2)
 	}
 
 	return conn, nil

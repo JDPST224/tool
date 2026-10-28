@@ -3,6 +3,8 @@
 # A scheme prefix (http://, https://, socks4://, socks5://) is optional and is
 # only informative; the PROXY_TYPE command-line argument decides the protocol.
 # Comments and blank lines are ignored. Proxy authentication is not supported.
+# New connections rotate proxies according to --proxy-rotation (round-robin by
+# default); failed proxies are skipped for 15 seconds.
 #
 # 127.0.0.1:8080
 # 10.0.0.5:3128
